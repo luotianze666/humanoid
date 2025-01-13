@@ -148,8 +148,7 @@ class Network(nn.Module):
             answer_action = actions[-1, :, :].clone()
             actions = actions[:-1, :, :].clone()
 
-        assert states.shape[0] == self.range + \
-            1 and actions.shape[0] == self.range, "Length incorrect."
+        assert states.shape[0] == self.range + 1 and actions.shape[0] == self.range, "Length incorrect."
 
         states = self.input_obs(states)
         actions = self.input_act(actions)
@@ -186,12 +185,11 @@ class Network(nn.Module):
             #         action_out_pre[i+1] + action_out_pre[i] * (1-self.ema)
             # action_ema = action_out_pre[-1]
             # alpha, beta = self.output_act(action_ema)
+
             if use_mean_action == False:
-                action_out, action_log_prob = self.output_act.action_prob(
-                    alpha, beta)
+                action_out, action_log_prob = self.output_act.action_prob(alpha, beta)
             else:
-                action_out = (alpha/(alpha + beta)
-                              ).clamp(min=0.0001, max=0.9999) * 2 - 1
+                action_out = (alpha/(alpha + beta)).clamp(min=0.0001, max=0.9999) * 2 - 1
                 action_log_prob = self.output_act.logp(alpha, beta, action_out)
 
             return action_out, action_log_prob, value
@@ -300,7 +298,7 @@ class PPO_MODEL:
 
     def __init__(self, env: SubprocVecEnv, load_path=None):
         self.name = env_name
-        self.device = "cuda"
+        self.device = "cuda:"+str(device)
         self.env = env
         self.env_num = self.env.num_envs
         self.act_num = self.env.action_space.shape[0]
@@ -316,23 +314,21 @@ class PPO_MODEL:
         self.batch_size = 500
         self.train_epochs = 10
         self.total_steps = 10000000
-        self.total_rounds = int((self.total_steps - 1) /
-                                (self.steps * self.env_num)) + 1
+        self.total_rounds = int((self.total_steps - 1) / (self.steps * self.env_num)) + 1
         self.now_round = 0
 
         assert self.env_num * self.steps % self.batch_size == 0, "Batchsize is incorrect"
-        self.batch_per_round = int(
-            self.env_num * self.steps * self.train_epochs / self.batch_size)
+        self.batch_per_round = int(self.env_num * self.steps * self.train_epochs / self.batch_size)
 
         self.reward_scale = 0.25
         self.init_lr = 4e-5
         self.final_lr = 1e-5
-        self.gamma = 0.99
+        self.gamma = 0.98
         self.gae = 0.95
         self.clip = 0.2
         self.entropy_scale = 0.05
         self.v_loss_scale = 0.3
-        self.state_loss_scale = 0.05
+        self.state_loss_scale = 0.01
         self.max_grad_norm = 0.5
         self.collectors = []
         self.s_data = []
@@ -341,20 +337,20 @@ class PPO_MODEL:
         self.a_data = []
         self.v_data = []
 
-        self.network = Network(
-            self.obs_num, self.dim, self.act_num, self.num_layers, 0.9, self.range)
+        self.network = Network(self.obs_num, self.dim, self.act_num, self.num_layers, 0.9, self.range)
+
         if load_path != None:
-            all = torch.load(load_path)
-            self.obs_mean = all['obs_mean']
-            self.obs_std = all['obs_std']
-            # self.obs_count = all['obs_count']
+            all = torch.load(load_path,map_location=lambda storage, loc: storage.cuda(0))
+            self.obs_mean = all['obs_mean'].cpu()
+            self.obs_std = all['obs_std'].cpu()
+            self.obs_count = all['obs_count']
             self.network.load_state_dict(all['network'])
+            
         self.network = self.network.to(self.device)
         # self.dp_network = nn.DataParallel(
         #     self.network, device_ids=[1, 2])
 
-        self.optimizer = torch.optim.Adam(
-            self.network.parameters(), lr=self.init_lr, eps=1e-6)
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.init_lr, eps=1e-6)
 
         # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer,
         #                                                             self.total_rounds*self.batch_per_round,
@@ -390,16 +386,14 @@ class PPO_MODEL:
                     s_input, a_input)
                 # print(a_out.shape, logp_out.shape, v_out.shape, s_out.shape)
 
-                value_loss = self.v_loss_scale * \
-                    (v_input - v_out).pow(2).mean()
-                state_loss = self.state_loss_scale * \
-                    (s_input[:, 1:, :] - s_out).pow(2).mean()
+                value_loss = self.v_loss_scale * (v_input - v_out).pow(2).mean()
+                state_loss = self.state_loss_scale * (s_input[:, 1:, :] - s_input[:, :-1,:] - s_out).pow(2).mean()
                 coef = (logp_out - logp_input).exp()
+
                 # print(logp_out.exp().mean(), logp_input.exp().mean())
                 entropy_loss = self.entropy_scale * (coef * logp_out).mean()
                 ppo_loss1 = (adv_input * coef)
-                ppo_loss2 = (
-                    adv_input * torch.clip(coef, 1-self.clip, 1+self.clip))
+                ppo_loss2 = (adv_input * torch.clip(coef, 1-self.clip, 1+self.clip))
 
                 value_show = (v_input - v_out).abs().mean()
 
@@ -424,8 +418,7 @@ class PPO_MODEL:
         with torch.no_grad():
 
             init_state = torch.tensor(self.env.reset()[0], dtype=torch.float32)
-            new_mean = self.obs_mean + \
-                (init_state - self.obs_mean) / (self.obs_count + 1)
+            new_mean = self.obs_mean + (init_state - self.obs_mean) / (self.obs_count + 1)
             if self.obs_count > 0:
                 self.obs_std = (((self.obs_count - 1) * self.obs_std.pow(2) + (
                     init_state - self.obs_mean) * (init_state - new_mean)) / self.obs_count).sqrt()
@@ -475,26 +468,24 @@ class PPO_MODEL:
                 for j in range(self.env_num):
                     # print(next_state[j].shape)
                     obs = torch.tensor(next_state[j], dtype=torch.float32)
-                    new_mean = self.obs_mean + \
-                        (obs - self.obs_mean) / (self.obs_count + 1)
+                    new_mean = self.obs_mean + (obs - self.obs_mean) / (self.obs_count + 1)
                     self.obs_std = (((self.obs_count - 1) * self.obs_std.pow(2) + (
                         obs - self.obs_mean) * (obs - new_mean)) / self.obs_count).sqrt()
                     self.obs_mean = new_mean
                     self.obs_count += 1
                     obs = (obs - self.obs_mean) / (self.obs_std + 1e-8)
+
                     self.collectors[j].append(
-                        obs,
-                        torch.tensor(
-                            reward[j], dtype=torch.float32).unsqueeze(0),
+                        obs, torch.tensor(reward[j], dtype=torch.float32).unsqueeze(0),
                         value[j], logp[j], action[j])
 
                     if done[j] == True or i == self.steps-1:
                         now_reward = self.collectors[j].sum_reward()
                         all_reward += now_reward
+
                         if done[j] == True:
                             full_trajectory_num += 1
-                            full_trajectory_length += \
-                                self.collectors[j].length()
+                            full_trajectory_length += self.collectors[j].length()
                             full_reward += now_reward
                             tqdmLoader.set_postfix(avg_obs_mean=self.obs_mean.abs().mean().item(),
                                                    avg_obs_std=self.obs_std.abs().mean().item(),
@@ -503,8 +494,7 @@ class PPO_MODEL:
                                                    avg_step_reward=all_reward/(i+1)/self.env_num)
 
                         s_tensor, a_tensor, logp_tensor, adv_tensor, v_tensor = \
-                            self.collectors[j].to_dataset(
-                                gae=self.gae, discount=self.gamma)
+                            self.collectors[j].to_dataset(gae=self.gae, discount=self.gamma)
 
                         self.s_data.append(s_tensor)
                         self.a_data.append(a_tensor)
@@ -590,9 +580,10 @@ class PPO_MODEL:
             full_trajectory_length = 0
             full_reward = 0
             all_reward = 0
-            tqdmLoader = trange(self.steps, desc=f'Evaluation:')
+            tqdmLoader = trange(self.steps, desc=f'Round {self.now_round} Evaluation')
             tqdmLoader.set_postfix(
                 average_trajectory_length=0, average_trajectory_reward=0, average_step_reward=0)
+            
             for i in tqdmLoader:
                 s = []
                 a = []
@@ -603,8 +594,8 @@ class PPO_MODEL:
 
                 s_input = torch.stack(s, dim=1).to(self.device)
                 a_input = torch.stack(a, dim=1).to(self.device)
-                action, logp, value = self.network.forward(
-                    s_input, a_input, rollout=True, use_mean_action=use_mean_action)
+                action, logp, value = self.network.forward(s_input, a_input, rollout=True, use_mean_action=use_mean_action)
+
                 action = action.cpu()
                 logp = logp.cpu()
                 value = value.cpu()
@@ -613,17 +604,15 @@ class PPO_MODEL:
                     obs = torch.tensor(next_state[j], dtype=torch.float32)
                     obs = (obs - self.obs_mean) / (self.obs_std + 1e-8)
                     self.collectors[j].append(
-                        obs,
-                        torch.tensor(
-                            reward[j], dtype=torch.float32).unsqueeze(0),
+                        obs,torch.tensor(reward[j], dtype=torch.float32).unsqueeze(0),
                         value[j], logp[j], action[j])
+                    
                     if done[j] == True or i == self.steps-1:
                         now_reward = self.collectors[j].sum_reward()
                         all_reward += now_reward
                         if done[j] == True:
                             full_trajectory_num += 1
-                            full_trajectory_length += \
-                                self.collectors[j].length()
+                            full_trajectory_length += self.collectors[j].length()
                             full_reward += now_reward
                             tqdmLoader.set_postfix(avg_obs_mean=self.obs_mean.abs().mean().item(),
                                                    avg_obs_std=self.obs_std.abs().mean().item(),
@@ -635,10 +624,13 @@ class PPO_MODEL:
     def learn(self):
         dir = './' + self.name+'/'
         self.evaluate()
+        self.gen_video()
         for _ in range(self.total_rounds):
             self.sample()
             self.train()
-            self.evaluate()
+            if _ % 10 == 0:
+                self.evaluate()
+                self.gen_video()
             os.makedirs(dir, exist_ok=True)
             torch.save({'obs_mean': self.obs_mean,
                         'obs_std': self.obs_std,
@@ -656,8 +648,10 @@ def make_env(rank, seed=0):
     return _init
 
 
-task = 0
-os.environ["CUDA_VISIBLE_DEVICES"] = str(7)
+task = 3
+device = 0
+# os.environ["PYOPENGL_PLATFORM"] = "egl"
+os.environ["MUJOCO_GL"] = "egl"
 if task == 0:
     env_name = "h1hand-walk-v0"
 elif task == 1:
@@ -674,27 +668,28 @@ env_num = 32
 
 if __name__ == "__main__":
     # for training
-    env = SubprocVecEnv([make_env(i) for i in range(env_num)])
+    env = SubprocVecEnv([make_env(i) for i in range(env_num)])     
     PPO_MODEL(env).learn()
 
+    # Generated Videos are in ./videos
     # env_name = "h1hand-walk-v0"
     # env = SubprocVecEnv([make_env(i) for i in range(1)])
-    # model = PPO_MODEL(env, './our_checkpoints/313.pt')
-    # model.gen_video('./our_videos/walk.mp4')
+    # model = PPO_MODEL(env, './checkpoints/walk.pt')
+    # model.gen_video('./videos/walk.mp4')
 
     # env_name = "h1hand-sit_hard-v0"
     # env = SubprocVecEnv([make_env(i) for i in range(1)])
-    # model = PPO_MODEL(env, './our_checkpoints/sit_hard.pt')
-    # model.gen_video('./our_videos/sit_hard.mp4')
+    # model = PPO_MODEL(env, './checkpoints/sit_hard.pt')
+    # model.gen_video('./videos/sit_hard.mp4')
 
     # env_name = "h1hand-truck-v0"
     # env = SubprocVecEnv([make_env(i) for i in range(1)])
-    # model = PPO_MODEL(env, './our_checkpoints/truck.pt')
-    # model.gen_video('./our_videos/truck.mp4')
+    # model = PPO_MODEL(env, './checkpoints/truck.pt')
+    # model.gen_video('./videos/truck.mp4')
 
     # env_name = "h1hand-bookshelf_simple-v0"
     # env = SubprocVecEnv([make_env(i) for i in range(1)])
-    # model = PPO_MODEL(env, './our_checkpoints/bookshelf_simple.pt')
-    # model.gen_video('./our_videos/bookshelf_simple.mp4')
+    # model = PPO_MODEL(env, './checkpoints/bookshelf_simple.pt')
+    # model.gen_video('./videos/bookshelf-simple.mp4')
 
     exit(0)
